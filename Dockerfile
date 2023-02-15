@@ -1,8 +1,8 @@
-ARG SOLANA_REVISION=v1.9.12-testnet-with_trx_cap
+ARG SOLANA_REVISION=v1.15.2
 ARG NEON_EVM_COMMIT=latest
 
-FROM neonlabsorg/solana:${SOLANA_REVISION} AS solana
-FROM neonlabsorg/evm_loader:${NEON_EVM_COMMIT} AS spl
+FROM solanalabs/solana:${SOLANA_REVISION} AS solana
+FROM us-central1-docker.pkg.dev/eclipse-362422/eclipse-docker-apps/neon-evm:${NEON_EVM_COMMIT} AS spl
 
 FROM rust as builder
 RUN apt update && apt install -y libudev-dev
@@ -16,20 +16,21 @@ ENV FAUCET_REVISION=${REVISION}
 RUN cargo build --release
 
 FROM debian:11
-RUN apt update && apt install -y ca-certificates curl
+RUN apt update && apt install -y ca-certificates curl jq
 RUN mkdir -p /opt/faucet
 ADD internal/id.json /opt/faucet/
-RUN mkdir -p /root/.config/solana && ln -s /opt/faucet/id.json /root/.config/solana/id.json
+RUN mkdir -p /root/.config/solana
+#RUN mkdir -p /root/.config/solana && ln -s /opt/faucet/id.json /root/.config/solana/id.json
 ADD *.sh /
 ADD faucet.conf /
 COPY --from=builder /usr/src/faucet/target/release/faucet /opt/faucet/
 RUN ln -s /opt/faucet/faucet /usr/local/bin/
 
-COPY --from=solana /opt/solana/bin/solana \
-		/opt/solana/bin/solana-faucet \
-		/opt/solana/bin/solana-keygen \
-		/opt/solana/bin/solana-validator \
-		/opt/solana/bin/solana-genesis \
+COPY --from=solana /usr/bin/solana \
+		/usr/bin/solana-faucet \
+		/usr/bin/solana-keygen \
+		/usr/bin/solana-validator \
+		/usr/bin/solana-genesis \
 		/usr/local/bin/
 COPY --from=spl /opt/spl-token \
 		/opt/neon-cli \
@@ -37,7 +38,7 @@ COPY --from=spl /opt/spl-token \
 		/opt/evm_loader-keypair.json \
 		/spl/bin/
 
-COPY --from=spl /opt/contracts/ci-tokens/owner-keypair.json /opt/faucet
+#COPY --from=spl /opt/contracts/ci-tokens/owner-keypair.json /opt/faucet
 
 COPY --from=spl /opt/spl-token \
 		/usr/local/bin/

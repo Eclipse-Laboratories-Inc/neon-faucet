@@ -1,0 +1,32 @@
+---
+serviceAccount: 'projects/$PROJECT_ID/serviceAccounts/eclipse-builds@eclipse-362422.iam.gserviceaccount.com'
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  script: |
+    #!/usr/bin/env bash
+    docker pull "${_IMAGE_NAME}" || exit 0
+  env:
+  - '_IMAGE_NAME=${_IMAGE_NAME}'
+- name: 'gcr.io/cloud-builders/docker'
+  script: |
+    #!/usr/bin/env bash
+    docker build \
+      -t "${_IMAGE_NAME}" \
+      --cache-from "${_IMAGE_NAME}" \
+      -f Dockerfile \
+      --build-arg "REVISION=$(git rev-parse HEAD)" \
+      --network=cloudbuild \
+      .
+  env:
+  - '_IMAGE_NAME=${_IMAGE_NAME}'
+  timeout: 3600s
+images:
+- '${_IMAGE_NAME}'
+substitutions:
+  _IMAGE_NAME: '${_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/neon-faucet:latest'
+  _LOCATION: us-central1
+  _REPOSITORY: eclipse-docker-apps
+options:
+  dynamic_substitutions: true
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
