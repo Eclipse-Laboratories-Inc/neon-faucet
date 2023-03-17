@@ -1,13 +1,21 @@
 //! Faucet server implementation.
 
+use std::collections::HashSet;
+use std::net::{IpAddr, ToSocketAddrs as _};
+use std::str::FromStr as _;
+use std::time::Duration;
+
 use actix_cors::Cors;
 use actix_web::http::{header, StatusCode};
-use actix_web::web::{get, post, Bytes};
-use actix_web::{App, HttpResponse, HttpServer, Responder};
-use eyre::Result;
+use actix_web::web::{get, post, Bytes, Data};
+use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder};
+use eyre::{eyre, Result};
+use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use crate::{active_requests, config, erc20_tokens, id, neon_token};
+use crate::{active_requests, config, erc20_tokens, id, neon_token, solana};
+
+type AirdropLimiter = Data<RwLock<neon_token::AirdropLimiter>>;
 
 /// Starts the server in listening mode.
 pub async fn start(workers: usize) -> Result<()> {
@@ -15,7 +23,49 @@ pub async fn start(workers: usize) -> Result<()> {
     let rpc_port = config::rpc_port();
     info!("{} Bind {}:{}", id::default(), rpc_bind, rpc_port);
 
-    HttpServer::new(|| {
+    let blacklist = config::blacklisted_ips()
+        .into_iter()
+        .map(|ip| IpAddr::from_str(&ip).map_err(|err| eyre!("Invalid blacklisted ip: {}", err)))
+        .collect::<Result<_>>()?;
+    let mut trusted_proxies = HashSet::new();
+    for uri in config::allowed_origins().into_iter() {
+        let uri = actix_web::http::Uri::from_str(&uri)
+            .map_err(|err| eyre!("Invalid trusted proxy '{}': {}", uri, err))?;
+        let host = uri
+            .host()
+            .ok_or_else(|| eyre!("Invalid trusted proxy '{}': no host", uri))?;
+        let ip = (host, 0)
+            .to_socket_addrs()
+            .map_err(|err| eyre!("Invalid trusted proxy '{}': {}", host, err))?
+            .next()
+            .ok_or_else(|| eyre!("Invalid trusted proxy '{}': lookup failed", host))?
+            .ip();
+        trusted_proxies.insert(ip);
+    }
+    let per_request_cap = solana::convert_whole_to_fractions(config::solana_max_amount())
+        .map_err(|err| eyre!("invalid max amount: {}", err))?;
+    let per_time_cap = solana::convert_whole_to_fractions(config::solana_per_time_max_amount())
+        .map_err(|err| eyre!("invalid per time max amount: {}", err))?;
+    let time_slice = Duration::from_secs(config::solana_time_slice_secs());
+
+    let airdrop_limiter = AirdropLimiter::new(RwLock::new(neon_token::AirdropLimiter::new(
+        trusted_proxies,
+        blacklist,
+        per_request_cap,
+        per_time_cap,
+    )));
+    let airdrop_limiter_1 = airdrop_limiter.clone();
+
+    let airdrop_limiter_reset = tokio::spawn(async move {
+        let mut clear_interval = tokio::time::interval(time_slice);
+        loop {
+            clear_interval.tick().await;
+            info!("Clearing airdrop limiter cache");
+            airdrop_limiter.write().await.clear_cache();
+        }
+    });
+
+    HttpServer::new(move || {
         let mut cors = Cors::default();
         let allowed_origins = config::allowed_origins();
         if !allowed_origins.is_empty() {
@@ -30,6 +80,7 @@ pub async fn start(workers: usize) -> Result<()> {
 
         App::new()
             .wrap(cors)
+            .app_data(airdrop_limiter_1.clone())
             .route("/request_ping", get().to(handle_request_ping))
             .route("/request_version", get().to(handle_request_version))
             .route(
@@ -44,6 +95,11 @@ pub async fn start(workers: usize) -> Result<()> {
     .workers(workers)
     .run()
     .await?;
+
+    airdrop_limiter_reset.abort();
+    if let Err(err) = airdrop_limiter_reset.await {
+        error!("Error in airdrop limiter reset thread: {:?}", err);
+    }
 
     Ok(())
 }
@@ -85,7 +141,11 @@ async fn handle_request_version() -> impl Responder {
 }
 
 /// Handles a request for NEON airdrop in galans (1 galan = 10E-9 NEON).
-async fn handle_request_neon_in_galans(body: Bytes) -> impl Responder {
+async fn handle_request_neon_in_galans(
+    limiter: AirdropLimiter,
+    req: HttpRequest,
+    body: Bytes
+) -> impl Responder {
     let id = id::generate();
     let counter = active_requests::increment();
 
@@ -100,14 +160,31 @@ async fn handle_request_neon_in_galans(body: Bytes) -> impl Responder {
     }
 
     let input = input.unwrap();
-    let airdrop = serde_json::from_str::<neon_token::Airdrop>(&input);
-    if let Err(err) = airdrop {
-        error!("{} BadRequest (json): {} in '{}'", id, err, input);
-        return HttpResponse::with_body(StatusCode::BAD_REQUEST, err.to_string());
-    }
-
-    let mut airdrop = airdrop.unwrap();
+    let mut airdrop = match serde_json::from_str::<neon_token::Airdrop>(&input) {
+        Ok(airdrop) => airdrop,
+        Err(err) => {
+            error!("{} BadRequest (json): {} in '{}'", id, err, input);
+            return HttpResponse::with_body(StatusCode::BAD_REQUEST, err.to_string());
+        }
+    };
     airdrop.in_fractions = true;
+
+    match limiter.write().await.check_cache(&req, &airdrop) {
+        Ok(_) => (),
+        Err(err @ neon_token::AirdropLimiterError::BadRequest) => {
+            error!("{} BadRequest: {} in '{:?}'", id, err, airdrop);
+            return HttpResponse::with_body(StatusCode::BAD_REQUEST, err.to_string());
+        },
+        Err(neon_token::AirdropLimiterError::CapExceeded(err)) => {
+            error!("{} TooManyRequests: {} in '{:?}'", id, err, airdrop);
+            return HttpResponse::with_body(StatusCode::TOO_MANY_REQUESTS, err.to_string());
+        },
+        Err(err @ neon_token::AirdropLimiterError::BadConversion) => {
+            error!("{} InternalServerError: {} in '{:?}'", id, err, airdrop);
+            return HttpResponse::with_body(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+        },
+    };
+
     if let Err(err) = neon_token::airdrop(&id, airdrop).await {
         error!("{} InternalServerError: {}", id, err);
         return HttpResponse::with_body(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
@@ -117,7 +194,11 @@ async fn handle_request_neon_in_galans(body: Bytes) -> impl Responder {
 }
 
 /// Handles a request for NEON airdrop.
-async fn handle_request_neon(body: Bytes) -> impl Responder {
+async fn handle_request_neon(
+    limiter: AirdropLimiter,
+    req: HttpRequest,
+    body: Bytes
+) -> impl Responder {
     let id = id::generate();
     let counter = active_requests::increment();
 
@@ -132,13 +213,28 @@ async fn handle_request_neon(body: Bytes) -> impl Responder {
     }
 
     let input = input.unwrap();
-    let airdrop = serde_json::from_str::<neon_token::Airdrop>(&input);
-    if let Err(err) = airdrop {
-        error!("{} BadRequest (json): {} in '{}'", id, err, input);
-        return HttpResponse::with_body(StatusCode::BAD_REQUEST, err.to_string());
-    }
+    let airdrop = match serde_json::from_str::<neon_token::Airdrop>(&input) {
+        Ok(airdrop) => airdrop,
+        Err(err) => {
+            error!("{} BadRequest (json): {} in '{}'", id, err, input);
+            return HttpResponse::with_body(StatusCode::BAD_REQUEST, err.to_string());
+        }
+    };
 
-    if let Err(err) = neon_token::airdrop(&id, airdrop.unwrap()).await {
+    match limiter.write().await.check_cache(&req, &airdrop) {
+        Ok(_) => (),
+        Err(err @ neon_token::AirdropLimiterError::BadRequest) => {
+            error!("{} BadRequest: {} in '{:?}'", id, err, airdrop);
+            return HttpResponse::with_body(StatusCode::BAD_REQUEST, err.to_string());
+        },
+        Err(neon_token::AirdropLimiterError::CapExceeded(err)) => {
+            error!("{} TooManyRequests: {} in '{:?}'", id, err, airdrop);
+            return HttpResponse::with_body(StatusCode::TOO_MANY_REQUESTS, err.to_string());
+        },
+        Err(neon_token::AirdropLimiterError::BadConversion) => unreachable!(),
+    };
+
+    if let Err(err) = neon_token::airdrop(&id, airdrop).await {
         error!("{} InternalServerError: {}", id, err);
         return HttpResponse::with_body(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
     }

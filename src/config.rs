@@ -81,6 +81,7 @@ const FAUCET_REVISION: &str = "FAUCET_REVISION";
 const FAUCET_RPC_BIND: &str = "FAUCET_RPC_BIND";
 const FAUCET_RPC_PORT: &str = "FAUCET_RPC_PORT";
 const FAUCET_RPC_ALLOWED_ORIGINS: &str = "FAUCET_RPC_ALLOWED_ORIGINS";
+const FAUCET_RPC_BLACKLISTED_IPS: &str = "FAUCET_RPC_BLACKLISTED_IPS";
 const FAUCET_WEB3_ENABLE: &str = "FAUCET_WEB3_ENABLE";
 const WEB3_RPC_URL: &str = "WEB3_RPC_URL";
 const WEB3_PRIVATE_KEY: &str = "WEB3_PRIVATE_KEY";
@@ -98,6 +99,8 @@ const NEON_HEAP_FRAME: &str = "NEON_HEAP_FRAME";
 const NEON_ADDITIONAL_FEE: &str = "NEON_ADDITIONAL_FEE";
 const NEON_OPERATOR_KEYFILE: &str = "NEON_OPERATOR_KEYFILE";
 const NEON_ETH_MAX_AMOUNT: &str = "NEON_ETH_MAX_AMOUNT";
+const NEON_ETH_PER_TIME_MAX_AMOUNT: &str = "NEON_ETH_PER_TIME_MAX_AMOUNT";
+const NEON_ETH_TIME_SLICE_SECS: &str = "NEON_ETH_TIME_SLICE_SECS";
 const NEON_LOG: &str = "NEON_LOG";
 const RUST_LOG: &str = "RUST_LOG";
 
@@ -106,6 +109,7 @@ static ENV: &[&str] = &[
     FAUCET_RPC_BIND,
     FAUCET_RPC_PORT,
     FAUCET_RPC_ALLOWED_ORIGINS,
+    FAUCET_RPC_BLACKLISTED_IPS,
     FAUCET_WEB3_ENABLE,
     WEB3_RPC_URL,
     WEB3_PRIVATE_KEY,
@@ -117,6 +121,8 @@ static ENV: &[&str] = &[
     EVM_LOADER,
     NEON_OPERATOR_KEYFILE,
     NEON_ETH_MAX_AMOUNT,
+    NEON_ETH_PER_TIME_MAX_AMOUNT,
+    NEON_ETH_TIME_SLICE_SECS,
     NEON_LOG,
     RUST_LOG,
 ];
@@ -155,6 +161,9 @@ pub fn load(file: &Path) -> Result<()> {
                 FAUCET_RPC_ALLOWED_ORIGINS => {
                     CONFIG.write().unwrap().rpc.allowed_origins = parse_list_of_strings(&val)?
                 }
+                FAUCET_RPC_BLACKLISTED_IPS => {
+                    CONFIG.write().unwrap().rpc.blacklisted_ips = parse_list_of_strings(&val)?
+                }
                 FAUCET_WEB3_ENABLE => CONFIG.write().unwrap().web3.enable = val.parse::<bool>()?,
                 WEB3_RPC_URL => CONFIG.write().unwrap().web3.rpc_url = val,
                 WEB3_PRIVATE_KEY => CONFIG.write().unwrap().web3.private_key = val,
@@ -175,6 +184,12 @@ pub fn load(file: &Path) -> Result<()> {
                 }
                 NEON_ETH_MAX_AMOUNT => {
                     CONFIG.write().unwrap().solana.max_amount = val.parse::<u64>()?
+                }
+                NEON_ETH_PER_TIME_MAX_AMOUNT => {
+                    CONFIG.write().unwrap().solana.per_time_max_amount = val.parse::<u64>()?
+                }
+                NEON_ETH_TIME_SLICE_SECS => {
+                    CONFIG.write().unwrap().solana.time_slice_secs = val.parse::<u64>()?
                 }
                 NEON_LOG => {}
                 RUST_LOG => {}
@@ -211,6 +226,11 @@ pub fn rpc_port() -> u16 {
 /// Gets the CORS `rpc.allowed_origins` urls.
 pub fn allowed_origins() -> Vec<String> {
     CONFIG.read().unwrap().rpc.allowed_origins.clone()
+}
+
+/// Gets the `rpc.blacklisted_ips` IP addresses.
+pub fn blacklisted_ips() -> Vec<String> {
+    CONFIG.read().unwrap().rpc.blacklisted_ips.clone()
 }
 
 /// Gets the `web3.enable` value.
@@ -306,6 +326,16 @@ pub fn solana_max_amount() -> u64 {
     CONFIG.read().unwrap().solana.max_amount
 }
 
+/// Gets the `solana.per_time_max_amount` value
+pub fn solana_per_time_max_amount() -> u64 {
+    CONFIG.read().unwrap().solana.per_time_max_amount
+}
+
+/// Gets the `solana.time_slice_secs` value
+pub fn solana_time_slice_secs() -> u64 {
+    CONFIG.read().unwrap().solana.time_slice_secs
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
@@ -313,6 +343,7 @@ struct Rpc {
     bind: String,
     port: u16,
     allowed_origins: Vec<String>,
+    blacklisted_ips: Vec<String>,
 }
 
 impl Rpc {
@@ -343,7 +374,13 @@ impl std::fmt::Display for Rpc {
         }
         write!(f, "rpc.allowed_origins = {:?}", self.allowed_origins)?;
         if env::var(FAUCET_RPC_ALLOWED_ORIGINS).is_ok() {
-            write!(f, " (overridden by {})", FAUCET_RPC_ALLOWED_ORIGINS)
+            writeln!(f, " (overridden by {})", FAUCET_RPC_ALLOWED_ORIGINS)?;
+        } else {
+            writeln!(f, "")?;
+        }
+        write!(f, "rpc.blacklisted_ips = {:?}", self.blacklisted_ips)?;
+        if env::var(FAUCET_RPC_BLACKLISTED_IPS).is_ok() {
+            write!(f, " (overridden by {})", FAUCET_RPC_BLACKLISTED_IPS)
         } else {
             write!(f, "")
         }
@@ -456,6 +493,8 @@ struct Solana {
     compute_budget_additional_fee: u32, // from neon params
     operator_keyfile: PathBuf,
     max_amount: u64,
+    per_time_max_amount: u64,
+    time_slice_secs: u64,
 }
 
 impl Solana {
@@ -494,7 +533,19 @@ impl Solana {
             }
             if self.max_amount == 0 {
                 return Err(Error::InvalidParameter(
-                    "web3.max_amount".into(),
+                    "solana.max_amount".into(),
+                    "0".into(),
+                ));
+            }
+            if self.per_time_max_amount == 0 {
+                return Err(Error::InvalidParameter(
+                    "solana.per_time_max_amount".into(),
+                    "0".into(),
+                ));
+            }
+            if self.time_slice_secs == 0 {
+                return Err(Error::InvalidParameter(
+                    "solana.time_slice_secs".into(),
                     "0".into(),
                 ));
             }
@@ -545,7 +596,19 @@ impl std::fmt::Display for Solana {
         }
         write!(f, "solana.max_amount = {}", self.max_amount)?;
         if env::var(NEON_ETH_MAX_AMOUNT).is_ok() {
-            write!(f, " (overridden by {})", NEON_ETH_MAX_AMOUNT)
+            writeln!(f, " (overridden by {})", NEON_ETH_MAX_AMOUNT)?;
+        } else {
+            writeln!(f, "")?;
+        }
+        write!(f, "solana.time_slice_secs = {}", self.time_slice_secs)?;
+        if env::var(NEON_ETH_TIME_SLICE_SECS).is_ok() {
+            writeln!(f, " (overridden by {})", NEON_ETH_TIME_SLICE_SECS)?;
+        } else {
+            writeln!(f, "")?;
+        }
+        write!(f, "solana.per_time_max_amount = {}", self.per_time_max_amount)?;
+        if env::var(NEON_ETH_PER_TIME_MAX_AMOUNT).is_ok() {
+            write!(f, " (overridden by {})", NEON_ETH_PER_TIME_MAX_AMOUNT)
         } else {
             write!(f, "")
         }
