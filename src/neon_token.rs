@@ -1,7 +1,13 @@
 //! Faucet NEON token module.
 
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::str::FromStr as _;
+
+use actix_web::{http, HttpRequest};
 use eyre::{eyre, Result};
-use tracing::info;
+use forwarded_header_value::ForwardedHeaderValue;
+use tracing::{error, info};
 
 use crate::{config, ethereum, id::ReqId, solana};
 
@@ -24,20 +30,6 @@ pub async fn airdrop(id: &ReqId, params: Airdrop) -> Result<()> {
     if config::solana_account_seed_version() == 0 {
         config::load_neon_params().await?;
         check_token_account(id).await?;
-    }
-
-    let limit = if !params.in_fractions {
-        config::solana_max_amount()
-    } else {
-        solana::convert_whole_to_fractions(config::solana_max_amount())?
-    };
-
-    if params.amount > limit {
-        return Err(eyre!(
-            "Requested value {} exceeds the limit {}",
-            params.amount,
-            limit
-        ));
     }
 
     let operator = config::solana_operator_keypair()
@@ -106,4 +98,152 @@ async fn check_token_account(id: &ReqId) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct AirdropCapExceeded {
+    requested: u64,
+    limit: u64,
+}
+
+impl std::fmt::Display for AirdropCapExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Requested value {} exceeds the limit {}", self.requested, self.limit)
+    }
+}
+
+#[derive(Debug)]
+pub enum AirdropLimiterError {
+    BadRequest,
+    CapExceeded(AirdropCapExceeded),
+    BadConversion,
+}
+
+impl std::error::Error for AirdropLimiterError {}
+
+impl std::fmt::Display for AirdropLimiterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::BadRequest => write!(f, "Bad airdrop request"),
+            Self::CapExceeded(err) => write!(f, "{}", err),
+            Self::BadConversion => write!(f, "Failed to convert to fractional token value"),
+        }
+    }
+}
+
+pub struct AirdropLimiter {
+    trusted_proxies: HashSet<IpAddr>,
+    blacklist: HashSet<IpAddr>,
+    // Token amounts in fractional units.
+    ip_cache: HashMap<IpAddr, u64>,
+    per_request_cap: u64,
+    per_time_cap: u64,
+}
+
+impl AirdropLimiter {
+    pub fn new(
+        trusted_proxies: HashSet<IpAddr>,
+        blacklist: HashSet<IpAddr>,
+        per_request_cap: u64,
+        per_time_cap: u64,
+    ) -> Self {
+        Self {
+            trusted_proxies,
+            blacklist,
+            ip_cache: Default::default(),
+            per_request_cap,
+            per_time_cap,
+        }
+    }
+
+    pub fn clear_cache(&mut self) {
+        self.ip_cache.clear();
+    }
+
+    pub fn check_cache(
+        &mut self,
+        req: &HttpRequest,
+        airdrop: &Airdrop
+    ) -> Result<(), AirdropLimiterError> {
+        let peer = self.get_peer(req)?;
+        let request_amount = Self::parse_amount(airdrop)?;
+        if request_amount > self.per_request_cap {
+            error!("Airdrop request capped at {}", self.per_request_cap);
+            return Err(AirdropLimiterError::CapExceeded(AirdropCapExceeded {
+                requested: request_amount,
+                limit: self.per_request_cap,
+            }));
+        }
+        let total = self.ip_cache
+            .entry(peer)
+            .or_default();
+            *total = total.saturating_add(request_amount);
+        if *total > self.per_time_cap {
+            error!("Airdrop requests capped at {}", self.per_time_cap);
+            return Err(AirdropLimiterError::CapExceeded(AirdropCapExceeded {
+                requested: *total,
+                limit: self.per_time_cap,
+            }));
+        }
+        Ok(())
+    }
+
+    fn get_peer(&self, req: &HttpRequest) -> Result<IpAddr, AirdropLimiterError> {
+        let peer = req
+            .peer_addr()
+            .map(|socket| socket.ip())
+            .ok_or_else(|| AirdropLimiterError::BadRequest)?;
+        if !self.trusted_proxies.contains(&peer) {
+            if self.blacklist.contains(&peer) {
+                return Err(AirdropLimiterError::CapExceeded(AirdropCapExceeded {
+                    requested: 0,
+                    limit: 0,
+                }));
+            }
+            return Ok(peer);
+        }
+        // If the peer is our known proxy, then we trust the forwarded headers if they exist.
+        // See https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Forwarded
+        let forwarded = match req.headers().get(http::header::FORWARDED) {
+            Some(forwarded) => {
+                let forwarded = forwarded
+                    .to_str()
+                    .map_err(|_| AirdropLimiterError::BadRequest)?;
+                ForwardedHeaderValue::from_str(forwarded)
+                    .map_err(|_| AirdropLimiterError::BadRequest)?
+            },
+            None => match req.headers().get("X-Forwarded-For") {
+                Some(forwarded) => {
+                    let forwarded = forwarded
+                        .to_str()
+                        .map_err(|_| AirdropLimiterError::BadRequest)?;
+                    ForwardedHeaderValue::from_x_forwarded_for(forwarded)
+                        .map_err(|_| AirdropLimiterError::BadRequest)?
+                },
+                None => {
+                    return Ok(peer)
+                },
+            }
+        };
+        let peer = forwarded
+            .proximate_forwarded_for_ip()
+            .ok_or_else(|| AirdropLimiterError::BadRequest)?;
+        if self.blacklist.contains(&peer) {
+            return Err(AirdropLimiterError::CapExceeded(AirdropCapExceeded {
+                requested: 0,
+                limit: 0,
+            }));
+        }
+        Ok(peer)
+    }
+
+    fn parse_amount(airdrop: &Airdrop) -> Result<u64, AirdropLimiterError> {
+        let request_amount = if airdrop.in_fractions {
+            airdrop.amount
+        } else {
+            solana::convert_whole_to_fractions(airdrop.amount)
+                .map_err(|_| AirdropLimiterError::BadConversion)?
+        };
+        Ok(request_amount)
+    }
 }
