@@ -1,0 +1,44 @@
+version: "3"
+services:
+  distribute-contract:
+    container_name: faucet
+    image: faucet
+    build:
+      dockerfile: Dockerfile
+      context: .
+    environment:
+      SOLANA_URL: "http://qa01-validator-rpc.dev.eclipsenetwork.xyz"
+      FAUCET_RPC_BIND: "0.0.0.0"
+      FAUCET_RPC_PORT: "3333"
+      FAUCET_RPC_ALLOWED_ORIGINS: '["https://faucet.eclipse.builders","https://eclipse-faucet-front-end.vercel.app","http://localhost:3000"]'
+      FAUCET_WEB3_ENABLE: true
+      WEB3_RPC_URL: "https://api.evm.qa01.dev.eclipsenetwork.xyz"
+      EVM_LOADER: "9SrdsYwr9GTjxNUSJpp4JzNv5NTpV4zHwzZo7hFGnrhQ"
+      NEON_TOKEN_MINT: "Bhzm927k4aTZfcNKFGXRY9YBFbth8jcuoz18SqmSTTaW"
+      NEON_TOKEN_MINT_DECIMALS: "9"
+      NEON_ETH_MAX_AMOUNT: "100"
+      NEON_ETH_PER_TIME_MAX_AMOUNT: "50"
+      NEON_ETH_TIME_SLICE_SECS: "60"
+      NEON_ERC20_TOKENS: '["0xB521b9F3484deF53545F276F1DAA50ef0Ca82E2d", "0x8a2a66CA0E5D491A001957edD45A6350bC76D708", "0x914782059DC42d4E590aeFCfdbF004B2EcBB9fAA", "0x7A7510b9b18241C788a7aAE8299D1fA6010D8128"]'
+      NEON_ERC20_MAX_AMOUNT: "100"
+      FAUCET_SOLANA_ENABLE: true
+      SOLANA_COMMITMENT: "confirmed"
+      RUST_LOG: "info"
+      WEB3_PRIVATE_KEY: "0xaf422491142f747d3da2abc81a790a91cdf42b9e91a8889e18bc32d58bf7e869"
+      NEON_OPERATOR_KEYPAIR: "[160,169,127,89,115,76,109,1,244,126,232,156,239,214,218,103,170,177,75,99,243,201,208,76,76,138,127,178,148,39,60,101,92,75,143,82,2,234,179,237,222,102,209,2,248,17,161,169,30,19,211,249,164,72,93,68,32,64,73,241,162,236,35,234]"
+      REFILL_DEBUG: false
+      REFILL_THRESHOLD: "25000"
+      REFILL_AMOUNT: "10000"
+      REFILL_ADDRESS: "0x0000000000000000000000000000000000000001"
+      REFILL_TIME_PERIOD_SECS: "30"
+      REFILL_TELEGRAM_TOKEN: "" # empty is disable, https://core.telegram.org/bots/tutorial#obtain-your-bot-token
+      REFILL_TELEGRAM_CHAT_ID: "" # empty is disable, can get from https://api.telegram.org/{REFILL_TELEGRAM_TOKEN}/getUpdates
+
+    volumes:
+      - ./entrypoint.sh:/entrypoint.sh
+    # command: ["sleep"]
+    # command: ["sleep", "123"]
+    # command: ["./run-faucet.sh"]
+    # command: ["run-faucet.sh"]
+    # command: ["run-faucet"]
+    command: ["auto-refill"]
